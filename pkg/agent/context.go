@@ -12,15 +12,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sipeed/picoclaw/pkg"
+	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/skills"
+	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
 type ContextBuilder struct {
-	workspace    string
-	skillsLoader *skills.SkillsLoader
-	memory       *MemoryStore
+	workspace          string
+	skillsLoader       *skills.SkillsLoader
+	memory             *MemoryStore
+	toolDiscoveryBM25  bool
+	toolDiscoveryRegex bool
+	splitOnMarker      bool
 
 	// Cache for system prompt to avoid rebuilding on every call.
 	// This fixes issue #607: repeated reprocessing of the entire context.
@@ -41,18 +47,32 @@ type ContextBuilder struct {
 	skillFilesAtCache map[string]time.Time
 }
 
+func (cb *ContextBuilder) WithToolDiscovery(useBM25, useRegex bool) *ContextBuilder {
+	cb.toolDiscoveryBM25 = useBM25
+	cb.toolDiscoveryRegex = useRegex
+	return cb
+}
+
+func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
+	cb.splitOnMarker = enabled
+	return cb
+}
+
 func getGlobalConfigDir() string {
+	if home := os.Getenv(config.EnvHome); home != "" {
+		return home
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".picoclaw")
+	return filepath.Join(home, pkg.DefaultPicoClawHome)
 }
 
 func NewContextBuilder(workspace string) *ContextBuilder {
 	// builtin skills: skills directory in current project
 	// Use the skills/ directory under the current working directory
-	builtinSkillsDir := strings.TrimSpace(os.Getenv("PICOCLAW_BUILTIN_SKILLS"))
+	builtinSkillsDir := strings.TrimSpace(os.Getenv(config.EnvBuiltinSkills))
 	if builtinSkillsDir == "" {
 		wd, _ := os.Getwd()
 		builtinSkillsDir = filepath.Join(wd, "skills")
@@ -68,8 +88,11 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 
 func (cb *ContextBuilder) getIdentity() string {
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
+	toolDiscovery := cb.getDiscoveryRule()
+	version := config.FormatVersion()
 
-	return fmt.Sprintf(`# picoclaw 🦞
+	return fmt.Sprintf(
+		`# picoclaw 🦞 (%s)
 
 You are picoclaw, a helpful AI assistant.
 
@@ -87,8 +110,29 @@ Your workspace is at: %s
 
 3. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
 
-4. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
-		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
+4. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.
+
+%s`,
+		version, workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, toolDiscovery)
+}
+
+func (cb *ContextBuilder) getDiscoveryRule() string {
+	if !cb.toolDiscoveryBM25 && !cb.toolDiscoveryRegex {
+		return ""
+	}
+
+	var toolNames []string
+	if cb.toolDiscoveryBM25 {
+		toolNames = append(toolNames, `"tool_search_tool_bm25"`)
+	}
+	if cb.toolDiscoveryRegex {
+		toolNames = append(toolNames, `"tool_search_tool_regex"`)
+	}
+
+	return fmt.Sprintf(
+		`5. **Tool Discovery** - Your visible tools are limited to save memory, but a vast hidden library exists. If you lack the right tool for a task, BEFORE giving up, you MUST search using the %s tool. Do not refuse a request unless the search returns nothing. Found tools will temporarily unlock for your next turn.`,
+		strings.Join(toolNames, " or "),
+	)
 }
 
 func (cb *ContextBuilder) BuildSystemPrompt() string {
@@ -117,6 +161,14 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 	memoryContext := cb.memory.GetMemoryContext()
 	if memoryContext != "" {
 		parts = append(parts, "# Memory\n\n"+memoryContext)
+	}
+
+	// Multi-Message Sending (if enabled)
+	if cb.splitOnMarker {
+		parts = append(parts, `# MULTI-MESSAGE OUTPUT
+You MUST frequently use <|[SPLIT]|> to break your responses into multiple short messages. NEVER output a single long wall of text. Actively split distinct concepts or parts. Example: Message part 1<|[SPLIT]|>Message part 2<|[SPLIT]|>Message part 3
+
+Each part separated by the marker will be sent as an independent message.`)
 	}
 
 	// Join with "---" separator
@@ -185,13 +237,10 @@ func (cb *ContextBuilder) InvalidateCache() {
 // invalidation (bootstrap files + memory). Skill roots are handled separately
 // because they require both directory-level and recursive file-level checks.
 func (cb *ContextBuilder) sourcePaths() []string {
-	return []string{
-		filepath.Join(cb.workspace, "AGENTS.md"),
-		filepath.Join(cb.workspace, "SOUL.md"),
-		filepath.Join(cb.workspace, "USER.md"),
-		filepath.Join(cb.workspace, "IDENTITY.md"),
-		filepath.Join(cb.workspace, "memory", "MEMORY.md"),
-	}
+	agentDefinition := cb.LoadAgentDefinition()
+	paths := agentDefinition.trackedPaths(cb.workspace)
+	paths = append(paths, filepath.Join(cb.workspace, "memory", "MEMORY.md"))
+	return uniquePaths(paths)
 }
 
 // skillRoots returns all skill root directories that can affect
@@ -395,18 +444,32 @@ func skillFilesChangedSince(skillRoots []string, filesAtCache map[string]time.Ti
 }
 
 func (cb *ContextBuilder) LoadBootstrapFiles() string {
-	bootstrapFiles := []string{
-		"AGENTS.md",
-		"SOUL.md",
-		"USER.md",
-		"IDENTITY.md",
+	var sb strings.Builder
+
+	agentDefinition := cb.LoadAgentDefinition()
+	if agentDefinition.Agent != nil {
+		label := string(agentDefinition.Source)
+		if label == "" {
+			label = relativeWorkspacePath(cb.workspace, agentDefinition.Agent.Path)
+		}
+		fmt.Fprintf(&sb, "## %s\n\n%s\n\n", label, agentDefinition.Agent.Body)
+	}
+	if agentDefinition.Soul != nil {
+		fmt.Fprintf(
+			&sb,
+			"## %s\n\n%s\n\n",
+			relativeWorkspacePath(cb.workspace, agentDefinition.Soul.Path),
+			agentDefinition.Soul.Content,
+		)
+	}
+	if agentDefinition.User != nil {
+		fmt.Fprintf(&sb, "## %s\n\n%s\n\n", "USER.md", agentDefinition.User.Content)
 	}
 
-	var sb strings.Builder
-	for _, filename := range bootstrapFiles {
-		filePath := filepath.Join(cb.workspace, filename)
+	if agentDefinition.Source != AgentDefinitionSourceAgent {
+		filePath := filepath.Join(cb.workspace, "IDENTITY.md")
 		if data, err := os.ReadFile(filePath); err == nil {
-			fmt.Fprintf(&sb, "## %s\n\n%s\n\n", filename, data)
+			fmt.Fprintf(&sb, "## %s\n\n%s\n\n", "IDENTITY.md", data)
 		}
 	}
 
@@ -421,7 +484,23 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 //
 // See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 // See: https://platform.openai.com/docs/guides/prompt-caching
-func (cb *ContextBuilder) buildDynamicContext(channel, chatID string) string {
+func formatCurrentSenderLine(senderID, senderDisplayName string) string {
+	senderID = strings.TrimSpace(senderID)
+	senderDisplayName = strings.TrimSpace(senderDisplayName)
+
+	switch {
+	case senderDisplayName != "" && senderID != "":
+		return fmt.Sprintf("Current sender: %s (ID: %s)", senderDisplayName, senderID)
+	case senderDisplayName != "":
+		return fmt.Sprintf("Current sender: %s", senderDisplayName)
+	case senderID != "":
+		return fmt.Sprintf("Current sender: %s", senderID)
+	default:
+		return ""
+	}
+}
+
+func (cb *ContextBuilder) buildDynamicContext(channel, chatID, senderID, senderDisplayName string) string {
 	now := time.Now().Format("2006-01-02 15:04 (Monday)")
 	rt := fmt.Sprintf("%s %s, Go %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
 
@@ -430,6 +509,9 @@ func (cb *ContextBuilder) buildDynamicContext(channel, chatID string) string {
 
 	if channel != "" && chatID != "" {
 		fmt.Fprintf(&sb, "\n\n## Current Session\nChannel: %s\nChat ID: %s", channel, chatID)
+	}
+	if senderLine := formatCurrentSenderLine(senderID, senderDisplayName); senderLine != "" {
+		fmt.Fprintf(&sb, "\n\n## Current Sender\n%s", senderLine)
 	}
 
 	return sb.String()
@@ -440,7 +522,8 @@ func (cb *ContextBuilder) BuildMessages(
 	summary string,
 	currentMessage string,
 	media []string,
-	channel, chatID string,
+	channel, chatID, senderID, senderDisplayName string,
+	activeSkills ...string,
 ) []providers.Message {
 	messages := []providers.Message{}
 
@@ -456,7 +539,7 @@ func (cb *ContextBuilder) BuildMessages(
 	staticPrompt := cb.BuildSystemPromptWithCache()
 
 	// Build short dynamic context (time, runtime, session) — changes per request
-	dynamicCtx := cb.buildDynamicContext(channel, chatID)
+	dynamicCtx := cb.buildDynamicContext(channel, chatID, senderID, senderDisplayName)
 
 	// Compose a single system message: static (cached) + dynamic + optional summary.
 	// Keeping all system content in one message ensures every provider adapter can
@@ -472,6 +555,11 @@ func (cb *ContextBuilder) BuildMessages(
 	contentBlocks := []providers.ContentBlock{
 		{Type: "text", Text: staticPrompt, CacheControl: &providers.CacheControl{Type: "ephemeral"}},
 		{Type: "text", Text: dynamicCtx},
+	}
+
+	if skillsText := cb.buildActiveSkillsContext(activeSkills); skillsText != "" {
+		stringParts = append(stringParts, skillsText)
+		contentBlocks = append(contentBlocks, providers.ContentBlock{Type: "text", Text: skillsText})
 	}
 
 	if summary != "" {
@@ -502,10 +590,7 @@ func (cb *ContextBuilder) BuildMessages(
 		})
 
 	// Log preview of system prompt (avoid logging huge content)
-	preview := fullSystemPrompt
-	if len(preview) > 500 {
-		preview = preview[:500] + "... (truncated)"
-	}
+	preview := utils.Truncate(fullSystemPrompt, 500)
 	logger.DebugCF("agent", "System prompt preview",
 		map[string]any{
 			"preview": preview,
@@ -602,7 +687,73 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 		}
 	}
 
-	return sanitized
+	// Second pass: ensure every assistant message with tool_calls has matching
+	// tool result messages following it. This is required by strict providers
+	// like DeepSeek that enforce: "An assistant message with 'tool_calls' must
+	// be followed by tool messages responding to each 'tool_call_id'."
+	final := make([]providers.Message, 0, len(sanitized))
+	seenToolCallID := make(map[string]bool)
+	for i := 0; i < len(sanitized); i++ {
+		msg := sanitized[i]
+
+		// Deduplicate tool results by ToolCallID
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			if seenToolCallID[msg.ToolCallID] {
+				logger.DebugCF("agent", "Dropping duplicate tool result", map[string]any{
+					"tool_call_id": msg.ToolCallID,
+				})
+				continue
+			}
+			seenToolCallID[msg.ToolCallID] = true
+		}
+
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// Collect expected tool_call IDs
+			expected := make(map[string]bool, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				expected[tc.ID] = false
+			}
+
+			// Check following messages for matching tool results
+			toolMsgCount := 0
+			for j := i + 1; j < len(sanitized); j++ {
+				if sanitized[j].Role != "tool" {
+					break
+				}
+				toolMsgCount++
+				if _, exists := expected[sanitized[j].ToolCallID]; exists {
+					expected[sanitized[j].ToolCallID] = true
+				}
+			}
+
+			// If any tool_call_id is missing, drop this assistant message and its partial tool messages
+			allFound := true
+			for toolCallID, found := range expected {
+				if !found {
+					allFound = false
+					logger.DebugCF(
+						"agent",
+						"Dropping assistant message with incomplete tool results",
+						map[string]any{
+							"missing_tool_call_id": toolCallID,
+							"expected_count":       len(expected),
+							"found_count":          toolMsgCount,
+						},
+					)
+					break
+				}
+			}
+
+			if !allFound {
+				// Skip this assistant message and its tool messages
+				i += toolMsgCount
+				continue
+			}
+		}
+		final = append(final, msg)
+	}
+
+	return final
 }
 
 func (cb *ContextBuilder) AddToolResult(
@@ -629,6 +780,68 @@ func (cb *ContextBuilder) AddAssistantMessage(
 	// Always add assistant message, whether or not it has tool calls
 	messages = append(messages, msg)
 	return messages
+}
+
+func (cb *ContextBuilder) buildActiveSkillsContext(skillNames []string) string {
+	if cb.skillsLoader == nil || len(skillNames) == 0 {
+		return ""
+	}
+
+	var ordered []string
+	seen := make(map[string]struct{}, len(skillNames))
+	for _, name := range skillNames {
+		canonical, ok := cb.ResolveSkillName(name)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		ordered = append(ordered, canonical)
+	}
+	if len(ordered) == 0 {
+		return ""
+	}
+
+	content := cb.skillsLoader.LoadSkillsForContext(ordered)
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+
+	return fmt.Sprintf(`# Active Skills
+
+The following skills are active for this request. Follow them when relevant.
+
+%s`, content)
+}
+
+func (cb *ContextBuilder) ListSkillNames() []string {
+	if cb.skillsLoader == nil {
+		return nil
+	}
+
+	allSkills := cb.skillsLoader.ListSkills()
+	names := make([]string, 0, len(allSkills))
+	for _, skill := range allSkills {
+		names = append(names, skill.Name)
+	}
+	return names
+}
+
+func (cb *ContextBuilder) ResolveSkillName(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" || cb.skillsLoader == nil {
+		return "", false
+	}
+
+	for _, skill := range cb.skillsLoader.ListSkills() {
+		if strings.EqualFold(skill.Name, name) {
+			return skill.Name, true
+		}
+	}
+
+	return "", false
 }
 
 // GetSkillsInfo returns information about loaded skills.
